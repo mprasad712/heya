@@ -3,7 +3,7 @@ import secrets
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import and_, distinct, exists, func
+from sqlalchemy import and_, distinct, exists, func, or_
 from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
@@ -19,7 +19,7 @@ from agentcore.services.cache.user_cache import UserCacheService
 from agentcore.services.database.models.department.model import Department
 from agentcore.services.database.models.organization.model import Organization
 from agentcore.services.database.models.role.model import Role
-from agentcore.services.database.models.user.crud import get_user_by_id, get_user_by_username, update_user
+from agentcore.services.database.models.user.crud import get_user_by_id, update_user
 from agentcore.services.database.models.user.model import User, UserCreate, UserRead, UserUpdate
 from agentcore.services.database.models.user_department_membership.model import UserDepartmentMembership
 from agentcore.services.database.models.user_organization_membership.model import UserOrganizationMembership
@@ -43,6 +43,63 @@ def _normalize_identity(value: str | None) -> str | None:
     if not stripped:
         return None
     return stripped.lower() if "@" in stripped else stripped
+
+
+async def _resolve_existing_user_for_create(
+    session: DbSession,
+    *,
+    username: str,
+    email: str | None,
+) -> User | None:
+    identity_candidates = {username.lower()}
+    if email:
+        identity_candidates.add(email.lower())
+    elif "@" in username:
+        identity_candidates.add(username.lower())
+
+    existing = (
+        await session.exec(
+            select(User).where(
+                User.deleted_at.is_(None),
+                or_(
+                    func.lower(User.username).in_(list(identity_candidates)),
+                    func.lower(func.coalesce(User.email, "")).in_(list(identity_candidates)),
+                ),
+            )
+        )
+    ).all()
+    if existing:
+        existing.sort(
+            key=lambda user: (
+                1 if normalize_role(getattr(user, "role", "consumer")) != "consumer" else 0,
+                getattr(user, "updated_at", None) or getattr(user, "create_at", None),
+            ),
+            reverse=True,
+        )
+        return existing[0]
+
+    # If admin provided a local-part username (e.g. "deptadmin2"), try reusing
+    # a single existing consumer identity like "deptadmin2@company.com".
+    if "@" not in username:
+        local_part = username.lower()
+        consumer_candidates = (
+            await session.exec(
+                select(User).where(
+                    User.deleted_at.is_(None),
+                    func.lower(User.role) == "consumer",
+                )
+            )
+        ).all()
+        local_part_matches = []
+        for candidate in consumer_candidates:
+            username_local = (candidate.username or "").strip().lower().split("@", 1)[0]
+            email_local = (candidate.email or "").strip().lower().split("@", 1)[0]
+            if local_part and (username_local == local_part or email_local == local_part):
+                local_part_matches.append(candidate)
+        if len(local_part_matches) == 1:
+            return local_part_matches[0]
+
+    return None
 
 
 async def _assignable_roles_for_creator(session: DbSession, creator_role: str) -> list[str]:
@@ -264,18 +321,28 @@ async def add_user(
         organization_name = _strip_or_none(user.organization_name)
         organization_description = _strip_or_none(user.organization_description)
         country = _strip_or_none(user.country)
+        creator_role = normalize_role(getattr(current_user, "role", "developer"))
+        target_role = normalize_role(user.role)
+        assignable_roles = await _assignable_roles_for_creator(session, creator_role)
 
-        existing_user = await get_user_by_username(session, username)
-        if not existing_user and email:
-            existing_user = await get_user_by_username(session, email)
+        existing_user = await _resolve_existing_user_for_create(
+            session,
+            username=username,
+            email=email,
+        )
         is_reusing_consumer = bool(
             existing_user and normalize_role(getattr(existing_user, "role", "consumer")) == "consumer"
         )
-        if existing_user and not is_reusing_consumer:
+        is_reusing_same_role = bool(
+            existing_user
+            and not is_reusing_consumer
+            and normalize_role(getattr(existing_user, "role", "consumer")) == target_role
+        )
+        if existing_user and not is_reusing_consumer and not is_reusing_same_role:
             raise HTTPException(status_code=400, detail="This username is unavailable.")
 
         raw_password = user.password or secrets.token_urlsafe(32)
-        if is_reusing_consumer and existing_user:
+        if (is_reusing_consumer or is_reusing_same_role) and existing_user:
             new_user = existing_user
             new_user.display_name = display_name or new_user.display_name
             new_user.email = new_user.email or email or username
@@ -292,9 +359,6 @@ async def add_user(
             new_user = User.model_validate(user_payload, from_attributes=True)
 
         creator_email = getattr(current_user, "username", None)
-        creator_role = normalize_role(getattr(current_user, "role", "developer"))
-        target_role = normalize_role(user.role)
-        assignable_roles = await _assignable_roles_for_creator(session, creator_role)
         new_user.creator_email = creator_email
         new_user.creator_role = creator_role
         new_user.created_by = current_user.id
